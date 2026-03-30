@@ -57,16 +57,29 @@ def build_pyg_data(adata, use_pca=True, sparsify_large_graphs=True, max_edges_pe
     print(f"Available obsm keys: {list(adata.obsm.keys())}")
     
     if use_pca:
-        # Always compute PCA with exactly 50 components for consistency
-        print("Computing PCA with exactly 50 components...")
-        sc.tl.pca(adata, n_comps=50, svd_solver="arpack")
-        print(f"PCA computed, shape: {adata.obsm['X_pca'].shape}")
+        num_features = adata.shape[1]
+        if num_features <= 50:
+            print(f"Feature count ({num_features}) is low. Skipping PCA and using raw features for graph construction.")
+            # Mock X_pca with raw data so follow-up steps (neighbors) work consistently
+            if sparse.issparse(adata.X):
+                adata.obsm["X_pca"] = adata.X.toarray()
+            else:
+                adata.obsm["X_pca"] = np.array(adata.X)
+        else:
+            # Always compute PCA with exactly 50 components for consistency when feature count allows
+            print("Computing PCA with 50 components...")
+            sc.tl.pca(adata, n_comps=50, svd_solver="arpack")
+            print(f"PCA computed, shape: {adata.obsm['X_pca'].shape}")
 
     if "connectivities" not in adata.obsp:
         print("Computing neighbor graph first...")
-        sc.pp.neighbors(adata, n_neighbors=15, n_pcs=50 if use_pca else None)
+        # Use X_pca (which we ensured exists) if use_pca is True
+        sc.pp.neighbors(adata, n_neighbors=15, use_rep="X_pca" if use_pca else None)
 
     if "leiden" not in adata.obs:
+        # Check if we have neighbors computed
+        if "connectivities" not in adata.obsp:
+             sc.pp.neighbors(adata, n_neighbors=15)
         print("Computing leiden clusters first...")
         sc.tl.leiden(adata, resolution=1.0)
 
@@ -78,11 +91,9 @@ def build_pyg_data(adata, use_pca=True, sparsify_large_graphs=True, max_edges_pe
             adata = sparsify_graph(adata, max_edges_per_node)
 
     if use_pca:
-        if "X_pca" not in adata.obsm:
-            print("Warning: X_pca not found, computing PCA...")
-            sc.tl.pca(adata, n_comps=50, svd_solver="arpack")
+        # We ensured X_pca exists above
         node_features = adata.obsm["X_pca"]
-        print(f"Using PCA features, shape: {node_features.shape}")
+        print(f"Using representation for nodes, shape: {node_features.shape}")
     else:
         # Handle both sparse and dense matrices
         if sparse.issparse(adata.X):

@@ -4,6 +4,7 @@ from torch_geometric.nn import GATConv, TransformerConv
 from torch_geometric.utils import softmax as segment_softmax
 from torch_scatter import scatter_add
 from torch import nn
+from typing import Optional
 import math
 
 class GraphPositionalEncoding(nn.Module):
@@ -543,7 +544,7 @@ class GATWithTransformerFusion(torch.nn.Module):
                  nhead=8, num_layers=3, use_adapters=True, reduction_factor=4, 
                  adapter_l2_reg=1e-4, use_positional_encoding=True, 
                  use_sparse_attention=True, neighborhood_size=50,
-                 num_cell_types: int | None = None):
+                 num_cell_types: Optional[int] = None):
         super().__init__()
         self.dropout = dropout
         self.use_adapters = use_adapters
@@ -551,7 +552,6 @@ class GATWithTransformerFusion(torch.nn.Module):
         self.use_positional_encoding = use_positional_encoding
         self.use_sparse_attention = use_sparse_attention
         self.num_cell_types = num_cell_types
-        
         self.gat_rna1 = GATConv(in_channels, hidden_channels, heads=heads, dropout=dropout)
         self.gat_rna2 = GATConv(hidden_channels * heads, hidden_channels, heads=1, dropout=dropout)
         

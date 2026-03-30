@@ -100,6 +100,9 @@ def zscore_normalize(adata: ad.AnnData) -> Tuple[ad.AnnData, np.ndarray, np.ndar
     return adata_zscore, means, stds
 
 
+from typing import Dict, Tuple, List, Optional
+
+
 def prepare_train_test_anndata(
     GSM_Controls_RNA=sc.read_h5ad("/projects/vanaja_lab/satya/Datasets/GSMControlRNA.h5ad"),
     GSM_Controls_ADT=sc.read_h5ad("/projects/vanaja_lab/satya/Datasets/ControlADT.h5ad"),
@@ -107,6 +110,7 @@ def prepare_train_test_anndata(
     GSM_AML_ADT_A=sc.read_h5ad("/projects/vanaja_lab/satya/Datasets/AMLAADT.h5ad"),
     GSM_AML_RNA_B=sc.read_h5ad("/projects/vanaja_lab/satya/Datasets/AMLBRNA.h5ad"),
     GSM_AML_ADT_B=sc.read_h5ad("/projects/vanaja_lab/satya/Datasets/AMLBADT.h5ad"),
+    marker_list: Optional[List[str]] = None,
 ):
     adata_gene = anndata.concat(
         [GSM_AML_RNA_B, GSM_AML_RNA_A, GSM_Controls_RNA],
@@ -121,6 +125,17 @@ def prepare_train_test_anndata(
         label="source",
         keys=["GSM_Controls_ADT", "GSM_AML_ADT_A", "GSM_AML_ADT_B"],
     )
+
+    if marker_list is not None:
+        available_markers = [m for m in marker_list if m in adata_protein.var_names]
+        if len(available_markers) == 0:
+            print("Warning: None of the requested markers were found. Using all markers.")
+        else:
+            if len(available_markers) < len(marker_list):
+                missing = set(marker_list) - set(available_markers)
+                print(f"Warning: Markers {missing} not found in dataset. Predicting {len(available_markers)} markers.")
+            adata_protein = adata_protein[:, available_markers].copy()
+            print(f"Successfully restricted to {len(available_markers)} surface markers.")
 
     print("All sample IDs in gene data:", adata_gene.obs["samples"].unique())
 

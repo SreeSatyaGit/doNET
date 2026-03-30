@@ -1,0 +1,2 @@
+commit	val_nrmse	val_pearson	val_auc	status	description
+7d5f5cf	1.091050	0.118620	0.967593	keep	baseline (HIDDEN=32, LAYERS=1, LR=1e-3)

@@ -1,101 +1,166 @@
 # DeepOMAPNet: Graph-Attention Multi-Modal Single-Cell Analysis
 
----
-
 <p align="center">
-  <img src="https://img.shields.io/badge/Status-Active-brightgreen.svg" alt="Status">
-  <img src="https://img.shields.io/badge/Focus-Bioinformatics_&_Deep_Learning-blue.svg" alt="Focus">
+  <img src="https://img.shields.io/badge/Python-3.8%2B-blue.svg" alt="Python">
+  <img src="https://img.shields.io/badge/PyTorch-2.0%2B-orange.svg" alt="PyTorch">
   <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License">
+  <img src="https://github.com/SreeSatyaGit/DeepOMAPNet/actions/workflows/ci.yml/badge.svg" alt="CI">
 </p>
 
-**DeepOMAPNet** is a high-performance deep learning framework designed for integrated multi-modal single-cell analysis (CITE-seq). By combining **Graph Attention Networks (GAT)** with **Cross-Modal Transformer Fusion**, DeepOMAPNet achieves superior accuracy in mapping RNA expression to surface protein (ADT) levels, while simultaneously enabling cell-type identification and disease classification (e.g., AML vs. Normal).
+**DeepOMAPNet** is a deep learning framework for integrated multi-modal single-cell analysis of CITE-seq data. It jointly maps RNA expression to surface protein (ADT) levels, classifies cell types, and performs disease diagnosis (e.g., AML vs. Normal) by combining **Graph Attention Networks (GAT)** with **Cross-Modal Transformer Fusion**.
 
 ---
 
-## ✨ Key Features
+## Architecture
 
-- **🧬 Multi-Modal Integration**: Bridging the gap between transcriptomics (RNA) and proteomics (ADT).
-- **🕸️ Graph-Based Learning**: Captures cellular heterogeneity by leveraging k-NN graph topologies.
-- **⚡ Transformer Fusion**: Advanced cross-modal attention mechanism for robust feature alignment.
-- **🎯 Multi-Task Optimization**: Simultaneous training on ADT regression, cell-type classification, and disease diagnosis.
-- **📈 Scalable & Efficient**: Sparse attention layers and automatic mixed-precision (AMP) for large-scale CITE-seq datasets.
-- **🔄 Transfer Learning**: Efficient adapter-based fine-tuning for cross-dataset application.
+```
+RNA expression (N × G)
+        │
+   GATConv ×2              ← topology-aware RNA encoding
+        │
+  GraphPositionalEncoding  ← degree + clustering coefficients
+        │
+TransformerFusion ×L       ← bidirectional RNA ↔ ADT cross-attention
+        │                     (sparse O(E) or dense O(N²))
+  ┌─────┴──────┐
+ADT Regression  AML Classification
+  [N × P]         [N × 1]
+```
+
+**Key components** (`scripts/model/doNET.py`):
+
+| Component | Role |
+|---|---|
+| `GATWithTransformerFusion` | End-to-end model: GAT encoder → TransformerFusion → multi-task heads |
+| `SparseCrossAttentionLayer` | O(E) cross-attention over edge lists — scales to >100 k cells |
+| `GraphPositionalEncoding` | Injects node degree and clustering coefficient into embeddings |
+| `AdapterLayer` | Bottleneck residual (dim → dim/r → dim) for parameter-efficient fine-tuning |
+| `TransformerFusion` | Stacks bidirectional cross-attention to fuse RNA and ADT modalities |
 
 ---
 
-## 🚀 Installation & Reproducibility
+## Results on Synthetic CITE-seq Benchmark
 
-DeepOMAPNet is developed in Python 3.8 and PyTorch. Follow these steps to set up a reproducible environment.
+500 cells (250 Normal, 250 AML) · 30 proteins · 500 genes · CPU, 15 s
 
-### 1. Requirements
-Ensure you have [Conda](https://docs.conda.io/en/latest/) installed.
+| Metric | Value |
+|---|---|
+| ADT prediction — mean Pearson r | **0.785** |
+| ADT prediction — best protein r | 0.948 |
+| AML classification — AUC-ROC | **0.836** |
+| AML classification — F1 | 0.719 |
 
-### 2. Environment Setup
+Reproduce with:
+
 ```bash
-# Clone the repository
+python run_experiment.py   # saves figures to results/
+```
+
+---
+
+## Installation
+
+```bash
 git clone https://github.com/SreeSatyaGit/DeepOMAPNet.git
 cd DeepOMAPNet
 
-# Create and activate environment
+# Conda (recommended)
 conda env create -f environment.yml
 conda activate deepomapnet
-```
 
-Alternatively, install via pip:
-```bash
+# or pip
 pip install -r requirements.txt
 ```
 
----
-
-## 📖 Getting Started
-
-We provide comprehensive tutorials to help you go from raw data to trained models.
-
-### 🏋️ Training
-To train the model on your own CITE-seq data:
-1.  Navigate to `Tutorials/Training.ipynb`.
-2.  Follow the data loading steps (supports `AnnData` objects).
-3.  Execute the training pipeline to generate model weights and performance metrics.
-
-### 🧪 Evaluation
-Use `Tutorials/Test.ipynb` to evaluate a pre-trained model on unseen datasets, generate UMAP visualizations, and compute correlation metrics (Pearson/Spearman).
-
-### 🔧 Fine-tuning
-For transfer learning on new datasets where modalities might be unaligned, refer to `Tutorials/Finetune.ipynb`.
+**Core dependencies:** PyTorch ≥ 2.0 · PyTorch Geometric ≥ 2.3 · ScanPy ≥ 1.9 · AnnData ≥ 0.9
 
 ---
 
-## 📂 Repository Structure
+## Tutorials
 
-| Module | Components |
-| :--- | :--- |
-| **`scripts/model/`** | `doNET.py` (Core GAT + Transformer architecture), Adapters, and Positional Encodings. |
-| **`scripts/data_provider/`** | `data_preprocessing.py` (CLR/Z-score normalization), `graph_data_builder.py` (PyG Graph conversion). |
-| **`scripts/trainer/`** | `gat_trainer.py` (Main training/eval loop), `fineTune.py` (Transfer learning logic). |
-| **`Tutorials/`** | Interactive Jupyter Notebooks for end-to-end workflows. |
-| **`R/`** | Supporting R scripts for WNN mapping and legacy preprocessing. |
-| **`publication_figures/`** | Placeholder for analytical plots and published result figures. |
+All end-to-end workflows are in `Tutorials/`:
 
----
-
-## 📐 Architecture Overview
-
-DeepOMAPNet's architecture is built on four pillars:
-1.  **GAT Encoder**: Learns 96-dimensional hidden representations from the gene expression k-NN graph.
-2.  **Positional Encoding**: Integrates graph statistics (degree, clustering coefficients) into the latent space.
-3.  **Cross-Modal Transformer**: Uses multi-head attention to fuse RNA and ADT information.
-4.  **Multi-Task Heads**: Specialized MLP branches for regression (ADT) and classification (AML/Cell-Type).
-
-Detailed diagram: [model_architecture.html](model_architecture.html)
+| Notebook | Purpose |
+|---|---|
+| `Training.ipynb` | Full training pipeline on real CITE-seq AnnData |
+| `Test.ipynb` | Evaluation, UMAP visualization, Pearson/Spearman metrics |
+| `Finetune.ipynb` | Adapter-based transfer learning to new datasets |
+| `scVI.ipynb` | Comparison with scVI baseline |
 
 ---
 
+## Synthetic Data
+
+`scripts/data_provider/synthetic_citeseq.py` provides a biologically realistic CITE-seq generator for benchmarking and testing:
+
+- 7 PBMC + AML cell types with biologically accurate marker profiles
+- 30-protein ADT panel (CD3, CD4, CD8, CD14, CD34, CD117, CD33, …)
+- Negative-binomial RNA counts + bimodal ADT expression
+- Tunable Normal vs. AML proportions
+
+```python
+from scripts.data_provider.synthetic_citeseq import generate_citeseq_dataset
+ds = generate_citeseq_dataset(n_normal=1000, n_aml=1000, seed=42)
+# ds.rna  [N, 500]  log-normalized + z-scored
+# ds.adt  [N, 30]   CLR-normalized
+```
+
 ---
 
-## ⚖️ License
+## Testing
 
-Distributed under the MIT License. See `LICENSE` for more information.
+```bash
+# Full test suite (87 tests)
+pytest
+
+# Single test file
+pytest tests/test_model_components.py -v
+
+# Single test
+pytest tests/test_training.py::TestLossDecreases::test_adt_loss_decreases_over_epochs -v
+```
+
+Test coverage:
+
+| File | Tests | Scope |
+|---|---|---|
+| `test_model_components.py` | 36 | Forward pass, gradients, sparse attention, adapters |
+| `test_data_pipeline.py` | 25 | CLR/Z-score normalization, graph validity, split integrity |
+| `test_training.py` | 10 | Loss decrease, gradient clipping, reproducibility |
+| `test_performance_benchmark.py` | 16 | Pearson r vs baselines, Wilcoxon test, AML AUC |
 
 ---
-Developed by **DeepOMAPNet Contributors** | [Link to Paper](https://github.com/SreeSatyaGit/DeepOMAPNet)
+
+## Repository Structure
+
+```
+DeepOMAPNet/
+├── scripts/
+│   ├── model/
+│   │   └── doNET.py                 # GATWithTransformerFusion + all components
+│   ├── data_provider/
+│   │   ├── data_preprocessing.py    # CLR / Z-score normalization
+│   │   ├── graph_data_builder.py    # k-NN graph → PyG Data objects
+│   │   └── synthetic_citeseq.py     # Realistic synthetic CITE-seq generator
+│   ├── trainer/
+│   │   ├── gat_trainer.py           # Multi-task training loop (AMP, early stopping)
+│   │   └── fineTune.py              # Adapter-based fine-tuning
+│   └── visualizations.py            # Publication-quality plotting utilities
+├── tests/                           # pytest test suite (87 tests)
+├── Tutorials/                       # Jupyter notebooks
+├── R/                               # Supporting R scripts (WNN, preprocessing)
+├── research/                        # Autoresearch experiment loop
+├── run_experiment.py                # Synthetic data → training → figures
+├── environment.yml
+└── requirements.txt
+```
+
+---
+
+## License
+
+MIT — see `LICENSE`.
+
+---
+
+Developed by the **DeepOMAPNet Contributors**.

@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data files (add real data paths here)
+*.h5ad
+*.h5
+*.loom
+data/
+
+# Generated outputs
+results/
+research/run.log
+research/__pycache__/
+
+# Model checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# Logs
+*.log

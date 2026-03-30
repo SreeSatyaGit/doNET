@@ -1,0 +1,21 @@
+[project]
+name = "deepomapnet-research"
+version = "0.1.0"
+description = "Autoresearch loop for DeepOMAPNet CITE-seq model"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0.0",
+    "torch-geometric>=2.3.0",
+    "torch-scatter>=2.1.0",
+    "numpy>=1.21.0",
+    "scipy>=1.9.0",
+    "scikit-learn>=1.1.0",
+    "anndata>=0.9.0",
+    "scanpy>=1.9.0",
+    "matplotlib>=3.5.0",
+]
+
+[tool.uv.sources]
+torch-scatter = [
+    { url = "https://data.pyg.org/whl/torch-2.0.0+cpu/torch_scatter-2.1.1+pt20cpu-cp310-cp310-macosx_11_0_arm64.whl", marker = "sys_platform == 'darwin' and python_version == '3.10'" },
+]
