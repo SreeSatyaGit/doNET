@@ -51,58 +51,69 @@ def sparsify_graph(adata, max_edges_per_node=50):
 
     return adata
 
-def build_pyg_data(adata, use_pca=True, sparsify_large_graphs=True, max_edges_per_node=50):
-    print(f"build_pyg_data called with use_pca={use_pca}")
-    print(f"Input adata shape: {adata.shape}")
-    print(f"Available obsm keys: {list(adata.obsm.keys())}")
+def build_pyg_data(adata, use_pca=True, use_rep=None, sparsify_large_graphs=True, max_edges_per_node=50):
+    """
+    Build a PyTorch Geometric Data object from an AnnData object.
     
-    if use_pca:
+    Args:
+        adata: Input AnnData.
+        use_pca: If True, uses PCA (or custom representation) for node features.
+        use_rep: Specific representation to use (e.g., 'X_integrated.cca', 'X_pca').
+                 If None and use_pca is True, defaults to 'X_pca'.
+        sparsify_large_graphs: If True, reduces edge density for large graphs.
+        max_edges_per_node: Maximum degree for sparsification.
+    """
+    print(f"build_pyg_data called with use_pca={use_pca}, use_rep={use_rep}")
+    print(f"Input adata shape: {adata.shape}")
+    
+    # Auto-detect best representation if not specified
+    if use_rep is None and use_pca:
+        if "X_integrated.cca" in adata.obsm:
+            use_rep = "X_integrated.cca"
+            print("Auto-detected X_integrated.cca. Using it for graph construction.")
+        elif "X_pca" in adata.obsm:
+            use_rep = "X_pca"
+        else:
+            use_rep = "X_pca" # Default to PCA below
+
+    if use_pca and use_rep == "X_pca":
         num_features = adata.shape[1]
         if num_features <= 50:
-            print(f"Feature count ({num_features}) is low. Skipping PCA and using raw features for graph construction.")
-            # Mock X_pca with raw data so follow-up steps (neighbors) work consistently
+            print(f"Feature count ({num_features}) is low. Using raw features.")
             if sparse.issparse(adata.X):
                 adata.obsm["X_pca"] = adata.X.toarray()
             else:
                 adata.obsm["X_pca"] = np.array(adata.X)
         else:
-            # Always compute PCA with exactly 50 components for consistency when feature count allows
             print("Computing PCA with 50 components...")
             sc.tl.pca(adata, n_comps=50, svd_solver="arpack")
             print(f"PCA computed, shape: {adata.obsm['X_pca'].shape}")
 
+    # Ensure neighbors are computed using the chosen representation
     if "connectivities" not in adata.obsp:
-        print("Computing neighbor graph first...")
-        # Use X_pca (which we ensured exists) if use_pca is True
-        sc.pp.neighbors(adata, n_neighbors=15, use_rep="X_pca" if use_pca else None)
+        print(f"Computing neighbor graph using rep: {use_rep if use_pca else 'raw X'}")
+        sc.pp.neighbors(adata, n_neighbors=15, use_rep=use_rep if use_pca else None)
 
     if "leiden" not in adata.obs:
-        # Check if we have neighbors computed
-        if "connectivities" not in adata.obsp:
-             sc.pp.neighbors(adata, n_neighbors=15)
-        print("Computing leiden clusters first...")
+        print("Computing leiden clusters...")
         sc.tl.leiden(adata, resolution=1.0)
 
     if sparsify_large_graphs:
         adjacency_matrix = adata.obsp["connectivities"]
         average_degree = adjacency_matrix.nnz / adjacency_matrix.shape[0]
         if average_degree > max_edges_per_node:
-            print(f"Large graph detected (avg degree: {average_degree:.1f}), applying sparsification...")
+            print(f"Applying sparsification (avg degree: {average_degree:.1f})...")
             adata = sparsify_graph(adata, max_edges_per_node)
 
     if use_pca:
-        # We ensured X_pca exists above
-        node_features = adata.obsm["X_pca"]
-        print(f"Using representation for nodes, shape: {node_features.shape}")
+        # Use the requested representation as node features
+        node_features = adata.obsm[use_rep]
+        print(f"Using {use_rep} for node features, shape: {node_features.shape}")
     else:
-        # Handle both sparse and dense matrices
-        if sparse.issparse(adata.X):
-            node_features = adata.X.toarray()
-        else:
-            node_features = adata.X
+        node_features = adata.X.toarray() if sparse.issparse(adata.X) else adata.X
         print(f"Using raw features, shape: {node_features.shape}")
+        
     node_labels = adata.obs["leiden"].astype(int).to_numpy()
-
     adjacency_matrix = adata.obsp["connectivities"].tocsr()
     upper_triangle = sparse.triu(adjacency_matrix, k=1)
     source_nodes, target_nodes = upper_triangle.nonzero()
