@@ -164,6 +164,25 @@ class GraphStatistics:
 
 
 @dataclass
+class InductiveEvalData:
+    """A held-out split as a fully independent graph for inductive evaluation.
+
+    Unlike the transductive (mask-based) path, the edges in this graph are
+    completely disjoint from the training graph, so no train-node information
+    leaks into the evaluation embeddings during the forward pass.
+    """
+
+    rna_data: object
+    adt_data: object
+    aml_labels: Optional[torch.Tensor]
+    celltype_labels: Optional[torch.Tensor]
+    node_degrees_rna: torch.Tensor
+    node_degrees_adt: torch.Tensor
+    clustering_coeffs_rna: torch.Tensor
+    clustering_coeffs_adt: torch.Tensor
+
+
+@dataclass
 class TrainingResult:
     """Complete result from GAT Transformer Fusion training."""
 
@@ -173,6 +192,8 @@ class TrainingResult:
     history: Dict[str, list]
     normalization: NormalizationParams
     graph_stats: GraphStatistics
+    inductive_test: Optional["InductiveEvalData"] = None
+    adt_names: Optional[List[str]] = None
 
     def get_best_val_r2(self) -> float:
         """Get the best validation R² achieved during training."""
@@ -215,6 +236,7 @@ class TrainingResult:
                     "adt_mean": self.normalization.adt_mean,
                     "adt_std": self.normalization.adt_std,
                 },
+                "adt_names": self.adt_names,
                 "graph_stats": {
                     "node_degrees_rna": self.graph_stats.node_degrees_rna,
                     "node_degrees_adt": self.graph_stats.node_degrees_adt,
@@ -359,6 +381,20 @@ def train_gat_transformer_fusion(
     aml_labels=None,
     rna_anndata=None,
     adt_anndata=None,
+    # ── Inductive held-out splits (preferred over internal mask splitting) ──
+    rna_val_data=None,
+    adt_val_data=None,
+    rna_test_data=None,
+    adt_test_data=None,
+    rna_val_anndata=None,
+    rna_test_anndata=None,
+    adt_val_anndata=None,
+    adt_test_anndata=None,
+    aml_val_labels=None,
+    aml_test_labels=None,
+    celltype_val_labels=None,
+    celltype_test_labels=None,
+    # ── Training hyper-parameters ────────────────────────────────────────────
     epochs: int = DEFAULT_EPOCHS,
     use_cpu_fallback: bool = False,
     seed: int = 42,
@@ -388,6 +424,7 @@ def train_gat_transformer_fusion(
     celltype_weight_schedule: str = "constant",
     log_file: Optional[str] = None,
     log_level: int = logging.INFO,
+    adt_names: Optional[List[str]] = None,
 ) -> TrainingResult:
     """
     Train GAT Transformer Fusion model for RNA-to-ADT mapping with multi-task learning.
@@ -485,12 +522,33 @@ def train_gat_transformer_fusion(
     rna_input_dim = rna_anndata.shape[1] if rna_anndata is not None else rna_data.x.size(1)
     num_nodes = rna_data.num_nodes
 
-    train_mask, val_mask, test_mask = _create_data_splits(
-        num_nodes, stratify_labels, train_fraction, val_fraction, seed
-    )
-    rna_data.train_mask = train_mask
-    rna_data.val_mask = val_mask
-    rna_data.test_mask = test_mask
+    if rna_val_data is not None and adt_val_data is not None:
+        # ── Inductive mode ────────────────────────────────────────────────────
+        # All nodes in rna_data are training nodes; val/test are separate graphs
+        # so the GAT cannot aggregate information across the split boundary.
+        logger.info(
+            "Inductive evaluation mode: external val/test graphs supplied. "
+            "Skipping internal _create_data_splits — no transductive leakage."
+        )
+        rna_data.train_mask = torch.ones(num_nodes, dtype=torch.bool)
+        rna_data.val_mask = torch.zeros(num_nodes, dtype=torch.bool)
+        rna_data.test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+        _use_inductive = True
+    else:
+        # ── Transductive fallback ─────────────────────────────────────────────
+        logger.warning(
+            "No external val/test graphs provided — falling back to internal "
+            "mask-based splitting. This is transductive: test nodes share edges "
+            "with training nodes. Pass rna_val_data/adt_val_data/rna_test_data/"
+            "adt_test_data for inductive evaluation."
+        )
+        train_mask, val_mask, test_mask = _create_data_splits(
+            num_nodes, stratify_labels, train_fraction, val_fraction, seed
+        )
+        rna_data.train_mask = train_mask
+        rna_data.val_mask = val_mask
+        rna_data.test_mask = test_mask
+        _use_inductive = False
 
     if rna_anndata is not None:
         rna_input_dim = _preprocess_rna_data(rna_data, rna_anndata)
@@ -573,6 +631,26 @@ def train_gat_transformer_fusion(
     if celltype_labels is not None:
         celltype_labels = torch.tensor(celltype_labels, dtype=torch.long, device=device)
 
+    # ── Prepare inductive held-out graphs (must happen after adt_mean/std are ready) ──
+    inductive_val = None
+    inductive_test = None
+    if _use_inductive:
+        inductive_val = _prepare_inductive_eval_data(
+            rna_val_data, adt_val_data,
+            aml_val_labels, celltype_val_labels,
+            adt_mean, adt_std, device,
+            rna_anndata=rna_val_anndata,
+            adt_anndata=adt_val_anndata,
+        )
+        if rna_test_data is not None and adt_test_data is not None:
+            inductive_test = _prepare_inductive_eval_data(
+                rna_test_data, adt_test_data,
+                aml_test_labels, celltype_test_labels,
+                adt_mean, adt_std, device,
+                rna_anndata=rna_test_anndata,
+                adt_anndata=adt_test_anndata,
+            )
+
     node_degrees_rna, clustering_coeffs_rna = _compute_graph_statistics(
         rna_data.edge_index, num_nodes
     )
@@ -641,7 +719,7 @@ def train_gat_transformer_fusion(
         model=model,
         rna_data=rna_data,
         adt_data=adt_data,
-        train_loader=train_loader, # New loader arg
+        train_loader=train_loader,
         aml_labels=aml_labels,
         optimizer=optimizer,
         scheduler=scheduler,
@@ -665,6 +743,8 @@ def train_gat_transformer_fusion(
         reg_weight_schedule=reg_weight_schedule,
         reg_weight_init=reg_weight_init,
         celltype_weight_schedule=celltype_weight_schedule,
+        inductive_val=inductive_val,
+        inductive_test=inductive_test,
     )
 
     _log_final_metrics(
@@ -680,6 +760,8 @@ def train_gat_transformer_fusion(
         clustering_coeffs_adt,
         use_mixed_precision,
         device,
+        inductive_val=inductive_val,
+        inductive_test=inductive_test,
     )
 
     return TrainingResult(
@@ -694,6 +776,8 @@ def train_gat_transformer_fusion(
             clustering_coeffs_rna=clustering_coeffs_rna,
             clustering_coeffs_adt=clustering_coeffs_adt,
         ),
+        inductive_test=inductive_test,
+        adt_names=adt_names,
     )
 
 
@@ -1155,7 +1239,7 @@ def _run_training_loop(
     model: torch.nn.Module,
     rna_data,
     adt_data,
-    train_loader: Optional[object], # New arg
+    train_loader: Optional[object],
     aml_labels: Optional[torch.Tensor],
     optimizer: torch.optim.Optimizer,
     scheduler,
@@ -1179,6 +1263,8 @@ def _run_training_loop(
     reg_weight_schedule: str = "decay",
     reg_weight_init: float = DEFAULT_REG_WEIGHT,
     celltype_weight_schedule: str = "constant",
+    inductive_val: Optional["InductiveEvalData"] = None,
+    inductive_test: Optional["InductiveEvalData"] = None,
 ) -> Dict[str, List]:
     """Run the main training loop with early stopping.
 
@@ -1265,18 +1351,30 @@ def _run_training_loop(
                 torch.cuda.empty_cache()
 
             eval_mixed = use_mixed_precision and not mixed_precision_disabled
-            val_metrics = _evaluate_model(
-                model, rna_data, adt_data, aml_labels, adt_mean, adt_std,
-                node_degrees_rna, node_degrees_adt, clustering_coeffs_rna, clustering_coeffs_adt,
-                rna_data.val_mask, current_mixed_precision, device,
-                celltype_labels,
-            )
-            test_metrics = _evaluate_model(
-                model, rna_data, adt_data, aml_labels, adt_mean, adt_std,
-                node_degrees_rna, node_degrees_adt, clustering_coeffs_rna, clustering_coeffs_adt,
-                rna_data.test_mask, current_mixed_precision, device,
-                celltype_labels,
-            )
+
+            if inductive_val is not None:
+                val_metrics = _evaluate_model_inductive(
+                    model, inductive_val, adt_mean, adt_std, eval_mixed, device
+                )
+            else:
+                val_metrics = _evaluate_model(
+                    model, rna_data, adt_data, aml_labels, adt_mean, adt_std,
+                    node_degrees_rna, node_degrees_adt, clustering_coeffs_rna, clustering_coeffs_adt,
+                    rna_data.val_mask, eval_mixed, device,
+                    celltype_labels,
+                )
+
+            if inductive_test is not None:
+                test_metrics = _evaluate_model_inductive(
+                    model, inductive_test, adt_mean, adt_std, eval_mixed, device
+                )
+            else:
+                test_metrics = _evaluate_model(
+                    model, rna_data, adt_data, aml_labels, adt_mean, adt_std,
+                    node_degrees_rna, node_degrees_adt, clustering_coeffs_rna, clustering_coeffs_adt,
+                    rna_data.test_mask, eval_mixed, device,
+                    celltype_labels,
+                )
 
             training_history["epoch"].append(epoch)
             training_history["train_loss"].append(adt_loss)
@@ -1775,6 +1873,114 @@ def _evaluate_model(
     }
 
 
+def _prepare_inductive_eval_data(
+    rna_data,
+    adt_data,
+    aml_labels,
+    celltype_labels,
+    adt_mean: torch.Tensor,
+    adt_std: torch.Tensor,
+    device: torch.device,
+    rna_anndata=None,
+    adt_anndata=None,
+) -> "InductiveEvalData":
+    """Normalize ADT features and pre-compute graph stats for a held-out PyG split.
+
+    The ADT data is normalized in-place using the *training* mean/std so that
+    denormalization in the evaluator is consistent with the training targets.
+    Graph statistics are computed from the held-out graph's own edges, so the
+    positional encoding sees only the topology of the isolated split.
+
+    If rna_anndata/adt_anndata are provided, the corresponding data.x tensors
+    are replaced with the raw matrices from those AnnData objects (mirroring
+    what _preprocess_rna_data/_preprocess_adt_data do for training).  This is
+    necessary when the PyG graphs were built from PCA-reduced features but
+    training used raw gene/protein counts.
+    """
+    # Replace PCA-reduced features with raw RNA from AnnData when provided
+    if rna_anndata is not None:
+        if hasattr(rna_anndata.X, "toarray"):
+            rna_data.x = torch.tensor(rna_anndata.X.toarray(), dtype=torch.float32)
+        else:
+            rna_data.x = torch.tensor(np.array(rna_anndata.X), dtype=torch.float32)
+
+    # Replace PCA-reduced features with raw ADT from AnnData when provided
+    if adt_anndata is not None:
+        if hasattr(adt_anndata.X, "toarray"):
+            adt_data.x = torch.tensor(adt_anndata.X.toarray(), dtype=torch.float32)
+        else:
+            adt_data.x = torch.tensor(np.array(adt_anndata.X), dtype=torch.float32)
+
+    # Apply training-set z-score to held-out ADT features
+    adt_data.x = (adt_data.x - adt_mean.cpu()) / adt_std.cpu()
+
+    num_nodes = rna_data.num_nodes
+    nd_rna, cc_rna = _compute_graph_statistics(rna_data.edge_index, num_nodes)
+    adt_edge_index = adt_data.edge_index if hasattr(adt_data, "edge_index") else rna_data.edge_index
+    nd_adt, cc_adt = _compute_graph_statistics(adt_edge_index, num_nodes)
+
+    rna_data = rna_data.to(device)
+    adt_data = adt_data.to(device)
+
+    if aml_labels is not None:
+        if not isinstance(aml_labels, torch.Tensor):
+            aml_labels = torch.tensor(aml_labels, dtype=torch.float32)
+        aml_labels = aml_labels.to(device)
+
+    if celltype_labels is not None:
+        if not isinstance(celltype_labels, torch.Tensor):
+            celltype_labels = torch.tensor(celltype_labels, dtype=torch.long)
+        celltype_labels = celltype_labels.to(device)
+
+    return InductiveEvalData(
+        rna_data=rna_data,
+        adt_data=adt_data,
+        aml_labels=aml_labels,
+        celltype_labels=celltype_labels,
+        node_degrees_rna=nd_rna.to(device),
+        node_degrees_adt=nd_adt.to(device),
+        clustering_coeffs_rna=cc_rna.to(device),
+        clustering_coeffs_adt=cc_adt.to(device),
+    )
+
+
+def _evaluate_model_inductive(
+    model: torch.nn.Module,
+    eval_data: "InductiveEvalData",
+    adt_mean: torch.Tensor,
+    adt_std: torch.Tensor,
+    use_mixed_precision: bool,
+    device: torch.device,
+) -> Dict[str, float]:
+    """Evaluate model on a completely isolated held-out graph.
+
+    Every node in ``eval_data`` is an evaluation node; there is no shared
+    edge structure with the training graph, eliminating transductive leakage.
+    """
+    if eval_data.rna_data.num_nodes == 0:
+        return _get_nan_metrics()
+
+    # Evaluate all nodes — full all-True mask
+    mask = torch.ones(eval_data.rna_data.num_nodes, dtype=torch.bool, device=device)
+
+    return _evaluate_model(
+        model,
+        eval_data.rna_data,
+        eval_data.adt_data,
+        eval_data.aml_labels,
+        adt_mean,
+        adt_std,
+        eval_data.node_degrees_rna,
+        eval_data.node_degrees_adt,
+        eval_data.clustering_coeffs_rna,
+        eval_data.clustering_coeffs_adt,
+        mask,
+        use_mixed_precision,
+        device,
+        eval_data.celltype_labels,
+    )
+
+
 # ============================================================================
 # REPORTING
 # ============================================================================
@@ -1793,35 +1999,45 @@ def _log_final_metrics(
     clustering_coeffs_adt: torch.Tensor,
     use_mixed_precision: bool,
     device: torch.device,
+    inductive_val: Optional["InductiveEvalData"] = None,
+    inductive_test: Optional["InductiveEvalData"] = None,
 ) -> None:
     """Log final metrics for all data splits."""
     logger.info("\n" + "=" * 80)
     logger.info("FINAL METRICS")
     logger.info("=" * 80)
 
-    splits = [
-        ("Train", rna_data.train_mask),
-        ("Val", rna_data.val_mask),
-        ("Test", rna_data.test_mask),
-    ]
+    # Train split is always evaluated on the training graph using its mask
+    train_metrics = _evaluate_model(
+        model, rna_data, adt_data, aml_labels, adt_mean, adt_std,
+        node_degrees_rna, node_degrees_adt, clustering_coeffs_rna, clustering_coeffs_adt,
+        rna_data.train_mask, use_mixed_precision, device,
+    )
 
-    for split_name, mask in splits:
-        metrics = _evaluate_model(
-            model,
-            rna_data,
-            adt_data,
-            aml_labels,
-            adt_mean,
-            adt_std,
-            node_degrees_rna,
-            node_degrees_adt,
-            clustering_coeffs_rna,
-            clustering_coeffs_adt,
-            mask,
-            use_mixed_precision,
-            device,
+    # Val/test: use isolated graphs when available, else fall back to masks
+    if inductive_val is not None:
+        val_metrics = _evaluate_model_inductive(
+            model, inductive_val, adt_mean, adt_std, use_mixed_precision, device
+        )
+    else:
+        val_metrics = _evaluate_model(
+            model, rna_data, adt_data, aml_labels, adt_mean, adt_std,
+            node_degrees_rna, node_degrees_adt, clustering_coeffs_rna, clustering_coeffs_adt,
+            rna_data.val_mask, use_mixed_precision, device,
         )
 
+    if inductive_test is not None:
+        test_metrics = _evaluate_model_inductive(
+            model, inductive_test, adt_mean, adt_std, use_mixed_precision, device
+        )
+    else:
+        test_metrics = _evaluate_model(
+            model, rna_data, adt_data, aml_labels, adt_mean, adt_std,
+            node_degrees_rna, node_degrees_adt, clustering_coeffs_rna, clustering_coeffs_adt,
+            rna_data.test_mask, use_mixed_precision, device,
+        )
+
+    for split_name, metrics in [("Train", train_metrics), ("Val", val_metrics), ("Test", test_metrics)]:
         logger.info(
             f"  {split_name:5s} | "
             f"MSE {metrics['MSE']:.6f}  RMSE {metrics['RMSE']:.6f}  "

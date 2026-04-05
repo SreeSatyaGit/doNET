@@ -8,53 +8,43 @@ from typing import Optional
 import math
 
 class GraphPositionalEncoding(nn.Module):
-    """Graph-aware positional encoding based on node connectivity"""
-    def __init__(self, embedding_dim, max_length=10000, dropout=0.1):
+    """Graph-aware positional encoding based on node connectivity.
+
+    Uses only topology-derived node attributes (degree and clustering
+    coefficient) so the encoding is purely permutation-equivariant.
+    Sequential node IDs carry no geometric meaning and are not used.
+    """
+    def __init__(self, embedding_dim, dropout=0.1):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.dropout = nn.Dropout(dropout)
-        
-        self.pos_embedding = nn.Parameter(torch.randn(max_length, embedding_dim))
-        nn.init.normal_(self.pos_embedding, std=0.02)
-        
-        self.degree_embedding = nn.Linear(1, embedding_dim // 4)
-        self.clustering_embedding = nn.Linear(1, embedding_dim // 4)
-        
+        # Each structural attribute projects to half the embedding dim;
+        # concatenating them fills the full embedding_dim.
+        self.degree_embedding = nn.Linear(1, embedding_dim // 2)
+        self.clustering_embedding = nn.Linear(1, embedding_dim // 2)
+
     def forward(self, x, edge_index=None, node_degrees=None, clustering_coeffs=None):
         """
         Args:
             x: Node features [N, embedding_dim]
-            edge_index: Graph edges [2, E] (optional)
+            edge_index: Graph edges [2, E] (unused, kept for API compatibility)
             node_degrees: Node degrees [N] (optional)
             clustering_coeffs: Clustering coefficients [N] (optional)
         """
         N = x.size(0)
-        
-        if N <= self.pos_embedding.size(0):
-            pos_enc = self.pos_embedding[:N]
-        else:
-            pos_enc = F.interpolate(
-                self.pos_embedding.unsqueeze(0).transpose(1, 2),
-                size=N, mode='linear', align_corners=False
-            ).squeeze(0).transpose(0, 1)
-        
-        base_dim = self.embedding_dim // 2
-        quarter_dim = self.embedding_dim // 4
-        base_enc = pos_enc[:, :base_dim]
-        
-        degree_enc = None
-        clustering_enc = None
+        half_dim = self.embedding_dim // 2
+
         if clustering_coeffs is not None:
             clustering_enc = self.clustering_embedding(clustering_coeffs.unsqueeze(-1).float())
         else:
-            clustering_enc = torch.zeros(x.size(0), quarter_dim, device=x.device, dtype=x.dtype)
+            clustering_enc = torch.zeros(N, half_dim, device=x.device, dtype=x.dtype)
+
         if node_degrees is not None:
             degree_enc = self.degree_embedding(node_degrees.unsqueeze(-1).float())
         else:
-            degree_enc = torch.zeros(x.size(0), quarter_dim, device=x.device, dtype=x.dtype)
-        
-        pos_enc = torch.cat([base_enc, clustering_enc, degree_enc], dim=-1)
-        
+            degree_enc = torch.zeros(N, half_dim, device=x.device, dtype=x.dtype)
+
+        pos_enc = torch.cat([clustering_enc, degree_enc], dim=-1)
         return self.dropout(x + pos_enc)
 
 class SparseCrossAttentionLayer(nn.Module):
