@@ -1,3 +1,4 @@
+<!-- program.md -->
 # DeepOMAPNet autoresearch
 
 Autonomous optimization of the DeepOMAPNet CITE-seq model.

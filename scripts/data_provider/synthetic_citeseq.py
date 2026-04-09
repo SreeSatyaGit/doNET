@@ -1,3 +1,4 @@
+# synthetic_citeseq.py
 """
 Realistic synthetic CITE-seq data generator for DeepOMAPNet.
 

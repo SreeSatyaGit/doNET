@@ -1,3 +1,4 @@
+# visualizations.py
 """
 DeepOMAPNet — Publication-quality visualization utilities.
 

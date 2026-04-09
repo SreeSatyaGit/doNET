@@ -1,3 +1,4 @@
+# requirements.txt
 # DeepOMAPNet Requirements
 # Core deep learning framework
 torch>=2.0.0

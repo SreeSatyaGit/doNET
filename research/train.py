@@ -1,3 +1,4 @@
+# train.py
 """
 DeepOMAPNet autoresearch training script.
 Mirrors the autoresearch pattern: fixed time budget, single metric, one file to edit.
