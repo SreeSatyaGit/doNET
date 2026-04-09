@@ -39,6 +39,7 @@ data/
 
 # Generated outputs
 results/
+!results/aml_protein_markers.png
 research/run.log
 research/__pycache__/
 
