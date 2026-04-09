@@ -1,6 +1,8 @@
 <!-- README.md -->
 # DeepOMAPNet
 
+![AML Protein Markers](results/aml_protein_markers.png)
+
 DeepOMAPNet is a deep learning framework for multi-modal single-cell analysis of CITE-seq data. Given RNA expression profiles, it simultaneously predicts surface protein (ADT) levels, classifies cell types, and performs disease diagnosis (AML vs. Normal). It does this by combining Graph Attention Networks (GAT) with cross-modal Transformer Fusion.
 
 ---
