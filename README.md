@@ -1,5 +1,5 @@
 <!-- README.md -->
-# DeepOMAPNet
+# doNet
 
 ![AML Protein Markers](results/aml_protein_markers.png)
 
