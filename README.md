@@ -112,9 +112,8 @@ DeepOMAPNet/
 │   ├── model/
 │   │   └── doNET.py                 # GATWithTransformerFusion and all model components
 │   ├── data_provider/
-│   │   ├── data_preprocessing.py    # CLR and Z-score normalization, train/val/test splitting
 │   │   ├── graph_data_builder.py    # k-NN graph construction, PCA, PyG Data objects
-│   │   └── synthetic_citeseq.py     # Synthetic CITE-seq data generator for testing
+│   │   └── data_preprocessing.py    # CLR and Z-score normalization, train/val/test splitting
 │   ├── trainer/
 │   │   └── gat_trainer.py           # Multi-task training loop with AMP and early stopping
 │   └── visualizations.py            # Plotting utilities
@@ -123,28 +122,9 @@ DeepOMAPNet/
 ├── tests/                           # pytest test suite
 ├── R/                               # Supporting R scripts (WNN, preprocessing)
 ├── research/                        # Experiment scripts
-├── run_experiment.py                # Synthetic data benchmark
+├── run_experiment.py                # Main experiment execution script
 ├── environment.yml
 └── requirements.txt
-```
-
----
-
-## Synthetic data generator
-
-`scripts/data_provider/synthetic_citeseq.py` provides a biologically realistic CITE-seq generator for testing and benchmarking, without requiring real patient data.
-
-- 7 PBMC and AML cell types with biologically accurate marker profiles
-- 30-protein ADT panel (CD3, CD4, CD8, CD14, CD34, CD117, CD33, and others)
-- Negative-binomial RNA counts with bimodal ADT expression
-- Configurable Normal vs. AML cell proportions
-
-```python
-from scripts.data_provider.synthetic_citeseq import generate_citeseq_dataset
-
-ds = generate_citeseq_dataset(n_normal=1000, n_aml=1000, seed=42)
-# ds.rna  -- shape [N, 500], log-normalized and z-scored
-# ds.adt  -- shape [N, 30],  CLR-normalized
 ```
 
 ---
