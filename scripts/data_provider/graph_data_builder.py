@@ -4,6 +4,7 @@ import numpy as np
 import scanpy as sc
 from scipy import sparse
 from torch_geometric.data import Data
+from torch_geometric.utils import to_undirected
 
 def sparsify_graph(adata, max_edges_per_node=50):
     if "connectivities" not in adata.obsp:
@@ -44,7 +45,8 @@ def sparsify_graph(adata, max_edges_per_node=50):
         shape=(num_nodes, num_nodes)
     )
 
-    sparse_adjacency = (sparse_adjacency + sparse_adjacency.T) / 2
+    # MEDIUM-6: keep an edge if EITHER direction survived pruning (logical max), not average
+    sparse_adjacency = sparse_adjacency.maximum(sparse_adjacency.T)
     adata.obsp["connectivities"] = sparse_adjacency
 
     new_average_degree = sparse_adjacency.nnz / num_nodes
@@ -116,9 +118,11 @@ def build_pyg_data(adata, use_pca=True, use_rep=None, sparsify_large_graphs=True
         
     node_labels = adata.obs["leiden"].astype(int).to_numpy()
     adjacency_matrix = adata.obsp["connectivities"].tocsr()
-    upper_triangle = sparse.triu(adjacency_matrix, k=1)
-    source_nodes, target_nodes = upper_triangle.nonzero()
+    # CRITICAL-9: GATConv expects bidirectional edges; extract all non-zero entries
+    # and call to_undirected to guarantee both (i→j) and (j→i) are present.
+    source_nodes, target_nodes = adjacency_matrix.nonzero()
     edge_index = torch.tensor(np.vstack([source_nodes, target_nodes]), dtype=torch.long)
+    edge_index = to_undirected(edge_index, num_nodes=adjacency_matrix.shape[0])
 
     pyg_data = Data(
         x=torch.tensor(node_features, dtype=torch.float32),
@@ -128,7 +132,19 @@ def build_pyg_data(adata, use_pca=True, use_rep=None, sparsify_large_graphs=True
 
     return pyg_data
 
-def extract_embeddings(model, pyg_data):
+def extract_embeddings(model, pyg_data, x_adt=None):
+    """Extract fused embeddings from the model for downstream analysis.
+
+    Args:
+        model: Trained GATWithTransformerFusion model.
+        pyg_data: PyG Data object (RNA graph with .x features).
+        x_adt: Optional raw ADT features [N, num_proteins].
+            ROBUSTNESS-P3-1: after the CRITICAL-2 fix, get_embeddings needs real
+            protein features to drive the ADT branch. Pass the same tensor used
+            during training (adt_data.x_raw or adt_data.x before z-scoring).
+            If None, the model falls back to RNA-derived ADT surrogate — the
+            resulting UMAP / clustering will not reflect true cross-modal fusion.
+    """
     model.eval()
 
     device = next(model.parameters()).device
@@ -136,11 +152,15 @@ def extract_embeddings(model, pyg_data):
         print(f"Moving data from {pyg_data.x.device} to {device}")
         pyg_data = pyg_data.to(device)
 
+    x_adt_dev = x_adt.to(device) if x_adt is not None else None
+
     with torch.no_grad():
         if device.type == 'cuda':
             torch.cuda.empty_cache()
 
-        node_embeddings = model.get_embeddings(pyg_data.x, pyg_data.edge_index)
+        node_embeddings = model.get_embeddings(
+            pyg_data.x, pyg_data.edge_index, x_adt=x_adt_dev
+        )
         node_embeddings = node_embeddings.cpu()
 
         if device.type == 'cuda':
@@ -167,7 +187,8 @@ def setup_graph_processing(rna_adata, adt_adata,
 
         if "connectivities" not in adt_adata.obsp:
             print("Computing neighbors for ADT data...")
-            sc.pp.neighbors(adt_adata, n_neighbors=n_neighbors, n_pcs=n_pcs)
+            # HIGH-8: ADT has ~30-200 features; skip PCA and use full protein space directly
+            sc.pp.neighbors(adt_adata, n_neighbors=n_neighbors, use_rep='X')
 
         rna_edges = rna_adata.obsp["connectivities"].nnz
         adt_edges = adt_adata.obsp["connectivities"].nnz
@@ -202,7 +223,11 @@ def process_data_with_graphs(rna_adata, adt_adata, **kwargs):
     print("Building PyG data objects...")
     rna_pyg_data = build_pyg_data(rna_adata, use_pca=True, sparsify_large_graphs=True,
                                   max_edges_per_node=config['max_edges_rna'])
-    adt_pyg_data = build_pyg_data(adt_adata, use_pca=True, sparsify_large_graphs=True,
+    # ROBUSTNESS-P3-2: ADT data has ~30–200 proteins; PCA of protein space is
+    # biologically meaningless (unlike RNA PCA which reduces 20k genes to signal).
+    # Use raw features directly (use_pca=False) so that the neighbor graph is
+    # built in full protein expression space and node features are actual counts.
+    adt_pyg_data = build_pyg_data(adt_adata, use_pca=False, sparsify_large_graphs=True,
                                   max_edges_per_node=config['max_edges_adt'])
 
     print(f"RNA PyG data - Nodes: {rna_pyg_data.num_nodes}, Edges: {rna_pyg_data.num_edges}, Features: {rna_pyg_data.num_node_features}")

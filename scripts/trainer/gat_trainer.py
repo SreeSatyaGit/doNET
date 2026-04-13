@@ -201,13 +201,60 @@ class TrainingResult:
         return max(self.history["val_R2"])
 
     def get_final_test_r2(self) -> float:
-        """Get the final test R²."""
+        """Get the test R² at the *last logged* evaluation epoch.
+
+        BUG-P3-2 note: this is NOT necessarily the test R² at the best validation
+        checkpoint. The model state is restored to the best val checkpoint after
+        training, but history entries were written during training. If the model
+        overfit after its best val epoch, this number will be pessimistic.
+        Use get_checkpoint_test_r2() (which re-evaluates on the restored checkpoint)
+        for a faithful test score.
+        """
         return self.history["test_R2"][-1]
 
+    def get_checkpoint_test_r2(self) -> float:
+        """Re-evaluate the best-checkpoint model on the test set and return R².
+
+        The model state is already the best-val checkpoint (restored at the end
+        of training). This method re-runs one evaluation pass to get the true
+        test R² for that checkpoint, independent of when the last log happened.
+        """
+        from scripts.trainer.gat_trainer import _evaluate_model, _compute_graph_statistics
+        import numpy as np
+        device = next(self.model.parameters()).device
+        num_nodes = self.rna_data.num_nodes
+        metrics = _evaluate_model(
+            self.model,
+            self.rna_data,
+            self.adt_data,
+            None,  # aml_labels not cached in result; use None for pure R2
+            self.normalization.adt_mean.to(device),
+            self.normalization.adt_std.to(device),
+            self.graph_stats.node_degrees_rna.to(device),
+            self.graph_stats.node_degrees_adt.to(device),
+            self.graph_stats.clustering_coeffs_rna.to(device),
+            self.graph_stats.clustering_coeffs_adt.to(device),
+            self.rna_data.test_mask,
+            False,  # AMP off for eval
+            device,
+        )
+        return metrics["R2"]
+
     def predict_adt(
-        self, rna_features: torch.Tensor, denormalize: bool = True
+        self, rna_features: torch.Tensor, x_adt: Optional[torch.Tensor] = None,
+        denormalize: bool = True
     ) -> torch.Tensor:
-        """Make ADT predictions and optionally denormalize."""
+        """Make ADT predictions and optionally denormalize.
+
+        Args:
+            rna_features: RNA node features [N, in_channels] on any device.
+            x_adt: Optional raw ADT features [N, adt_in_channels]. When provided
+                and the model was built with adt_in_channels, real protein
+                measurements drive the ADT branch (DESIGN-4 fix). At inference
+                time this is usually unavailable, so the model gracefully falls
+                back to its RNA-derived ADT surrogate when x_adt=None.
+            denormalize: If True, reverse the training z-score normalization.
+        """
         self.model.eval()
         with torch.no_grad():
             pred, _, _ = self.model(
@@ -222,6 +269,7 @@ class TrainingResult:
                 node_degrees_adt=self.graph_stats.node_degrees_adt,
                 clustering_coeffs_rna=self.graph_stats.clustering_coeffs_rna,
                 clustering_coeffs_adt=self.graph_stats.clustering_coeffs_adt,
+                x_adt=x_adt,
             )
         if denormalize:
             pred = self.normalization.denormalize(pred)
@@ -426,6 +474,7 @@ def train_gat_transformer_fusion(
     log_file: Optional[str] = None,
     log_level: int = logging.INFO,
     adt_names: Optional[List[str]] = None,
+    adt_already_normalized: bool = False,
 ) -> TrainingResult:
     """
     Train GAT Transformer Fusion model for RNA-to-ADT mapping with multi-task learning.
@@ -554,7 +603,20 @@ def train_gat_transformer_fusion(
     if rna_anndata is not None:
         rna_input_dim = _preprocess_rna_data(rna_data, rna_anndata)
 
-    adt_mean, adt_std = _preprocess_adt_data(adt_data, adt_anndata)
+    # BUG-P3-1: save the pre-normalisation ADT matrix as x_raw BEFORE
+    # _preprocess_adt_data writes z-scored values into adt_data.x.
+    # The model's adt_input_proj is designed to receive raw (CLR-only) protein
+    # values; feeding z-scored targets to it shifts the input distribution by
+    # the mean and collapses scale.  x_raw is indexed by global node IDs in
+    # the mini-batch path and used directly in the full-graph path.
+    adt_data.x_raw = adt_data.x.clone() if adt_anndata is None else None  # populated after preprocess
+    adt_mean, adt_std = _preprocess_adt_data(adt_data, adt_anndata, already_normalized=adt_already_normalized)
+    # After _preprocess_adt_data, adt_data.x is z-scored; x_raw must be the pre-z-score version.
+    # When adt_anndata is provided, _preprocess_adt_data overwrites adt_data.x with the raw
+    # AnnData matrix first, then z-scores it; capture x_raw at that intermediate point.
+    if adt_data.x_raw is None:
+        # adt_anndata path: x_raw = adt_data.x * adt_std + adt_mean (denormalise back)
+        adt_data.x_raw = adt_data.x * adt_std + adt_mean
     adt_output_dim = adt_data.x.size(1)
 
     if aml_labels is not None:
@@ -565,11 +627,16 @@ def train_gat_transformer_fusion(
         aml_labels = aml_labels_np
 
     # Apply caps with warnings (Phase 2.1)
+    # MEDIUM-3: also surface as a Python UserWarning so caller code can detect the
+    # silent architecture change (e.g. via warnings.filterwarnings).
+    import warnings
     if hidden_channels > MAX_HIDDEN_CHANNELS:
-        logger.warning(
-            f"Reducing hidden_channels from {hidden_channels} to {MAX_HIDDEN_CHANNELS} "
-            "for GPU memory constraints"
+        msg = (
+            f"hidden_channels={hidden_channels} capped to {MAX_HIDDEN_CHANNELS} "
+            "for GPU memory constraints. Pass enforce_memory_caps=False to disable."
         )
+        logger.warning(msg)
+        warnings.warn(msg, UserWarning, stacklevel=2)
         hidden_channels = MAX_HIDDEN_CHANNELS
 
     if num_heads > MAX_ATTENTION_HEADS:
@@ -612,6 +679,9 @@ def train_gat_transformer_fusion(
         dropout_rate=dropout_rate,
         device=device,
         num_cell_types=num_cell_types,
+        # CRITICAL-2: pass ADT feature dim so the model builds adt_input_proj
+        # and routes real protein measurements into the ADT branch.
+        adt_in_channels=adt_output_dim,
     )
 
     if torch.cuda.is_available():
@@ -1012,8 +1082,11 @@ def _create_data_splits(
 
         rest_labels = stratify_labels[rest_idx]
         val_size = int(val_fraction * num_nodes)
+        # ROBUSTNESS-4: cap the ratio at 0.95 to avoid StratifiedShuffleSplit
+        # raising ValueError when val_size >= len(rest_idx) on small datasets.
+        val_ratio = min(val_size / max(len(rest_idx), 1), 0.95)
         sss2 = StratifiedShuffleSplit(
-            n_splits=1, train_size=val_size / len(rest_idx), random_state=seed
+            n_splits=1, train_size=val_ratio, random_state=seed
         )
         val_rel, test_rel = next(sss2.split(rest_idx, rest_labels))
         val_idx = rest_idx[val_rel]
@@ -1047,6 +1120,7 @@ def _initialize_model(
     dropout_rate: float,
     device: torch.device,
     num_cell_types: Optional[int] = None,
+    adt_in_channels: Optional[int] = None,
 ) -> torch.nn.Module:
     """Initialize the GATWithTransformerFusion model.
 
@@ -1060,6 +1134,8 @@ def _initialize_model(
         dropout_rate: Dropout rate.
         device: Target device.
         num_cell_types: Optional number of cell types for classification head.
+        adt_in_channels: Number of raw ADT protein features. When provided,
+            real ADT measurements drive the ADT branch (CRITICAL-2 fix).
 
     Returns:
         Initialized model on the given device.
@@ -1079,6 +1155,7 @@ def _initialize_model(
         adapter_l2_reg=5e-5,
         use_positional_encoding=True,
         num_cell_types=num_cell_types,
+        adt_in_channels=adt_in_channels,
     ).to(device)
 
     return model
@@ -1104,15 +1181,19 @@ def _preprocess_rna_data(rna_data, rna_anndata) -> int:
 
 
 def _preprocess_adt_data(
-    adt_data, adt_anndata=None
+    adt_data, adt_anndata=None, already_normalized: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Load and prepare ADT data for training.
-
-    Note: If data comes from data_preprocessing.py, it is already CLR + z-score normalized.
 
     Args:
         adt_data: PyTorch Geometric data object.
         adt_anndata: Optional AnnData for preprocessing. If None, uses adt_data.x directly.
+        already_normalized: Set True when data was pre-normalised by
+            data_preprocessing.prepare_train_test_anndata (CLR + z-score).
+            Skips the in-place normalisation step so the data is not double-
+            normalised. The mean/std are still computed and returned so that
+            denormalisation in the evaluator is a consistent (near-)no-op.
+            (CRITICAL-6: the old code always re-normalised, corrupting targets.)
 
     Returns:
         Tuple of (mean, std) tensors for denormalization.
@@ -1124,14 +1205,12 @@ def _preprocess_adt_data(
             adt_tensor = torch.tensor(adt_anndata.X, dtype=torch.float32)
         adt_data.x = adt_tensor
 
-        adt_mean = adt_data.x.mean(dim=0, keepdim=True)
-        adt_std = adt_data.x.std(dim=0, keepdim=True) + EPSILON
+    adt_mean = adt_data.x.mean(dim=0, keepdim=True)
+    adt_std = adt_data.x.std(dim=0, keepdim=True) + EPSILON
 
-        if abs(adt_mean.mean().item()) < 0.01 and abs(adt_std.mean().item() - 1.0) < 0.01:
-            return adt_mean, adt_std
-    else:
-        adt_mean = adt_data.x.mean(dim=0, keepdim=True)
-        adt_std = adt_data.x.std(dim=0, keepdim=True) + EPSILON
+    if already_normalized:
+        # Data is already in normalised space; skip in-place transform.
+        return adt_mean, adt_std
 
     adt_data.x = (adt_data.x - adt_mean) / adt_std
     return adt_mean, adt_std
@@ -1169,8 +1248,12 @@ def _setup_training_components(
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=learning_rate, weight_decay=weight_decay
     )
+    # HIGH-5: evaluation runs every 10 epochs, so patience=10 means the LR would
+    # not drop until 100 real epochs without improvement (firing at most once in a
+    # 200-epoch run). Align patience to the evaluation cadence: patience=2 ≈ 20
+    # real epochs without improvement before the LR is reduced.
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=10
+        optimizer, mode="min", factor=0.5, patience=2
     )
     criterion = torch.nn.MSELoss()
     scaler = torch.cuda.amp.GradScaler(
@@ -1211,7 +1294,10 @@ def _compute_loss_weights(
     progress = epoch / epochs
 
     if reg_schedule == "decay":
-        reg_lambda = reg_init * (1 - progress)
+        # BUG-P3-4: floor at 10% of init so regularisation never reaches zero.
+        # At progress=1.0 (final epoch) the old formula gave reg_lambda=0,
+        # leaving adapters completely unregularised for the last training step.
+        reg_lambda = max(reg_init * (1 - progress), reg_init * 0.1)
     elif reg_schedule == "constant":
         reg_lambda = reg_init
     elif reg_schedule == "warmup":
@@ -1433,10 +1519,13 @@ def _run_training_loop(
                 bad_epochs = 0
             else:
                 bad_epochs += 1
-                if bad_epochs >= early_stopping_patience:
+                # CRITICAL-7: evaluation runs every 10 epochs, so bad_epochs counts
+                # *checks* not *epochs*. Convert to real epochs before comparing so
+                # patience=20 means "20 real epochs without improvement", not 200.
+                if bad_epochs * 10 >= early_stopping_patience:
                     logger.info(
                         f"Early stopping at epoch {epoch} "
-                        f"(no val R² improvement for {early_stopping_patience} checks)"
+                        f"(no val R² improvement for {early_stopping_patience} epochs)"
                     )
                     break
 
@@ -1461,8 +1550,13 @@ def _forward_pass(
     clustering_coeffs_adt: torch.Tensor,
     use_mixed_precision: bool,
     device: torch.device,
+    x_adt: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Perform forward pass through model.
+
+    Args:
+        x_adt: Raw ADT features to pass to the model's ADT branch.  When None
+               the model falls back to its internal fallback (RNA embeddings).
 
     Returns:
         Tuple of (adt_pred, aml_pred, fused).
@@ -1480,6 +1574,7 @@ def _forward_pass(
             node_degrees_adt=node_degrees_adt,
             clustering_coeffs_rna=clustering_coeffs_rna,
             clustering_coeffs_adt=clustering_coeffs_adt,
+            x_adt=x_adt,
         )
     return adt_pred, aml_pred, fused
 
@@ -1508,7 +1603,15 @@ def _compute_training_loss(
     # In mini-batch mode the batch object is the RNA subgraph; ADT targets are
     # stored as adt_x (attached before loader construction). Fall back to .x
     # for the full-graph path where adt_data is the actual ADT Data object.
-    adt_target = adt_data.adt_x if hasattr(adt_data, "adt_x") else adt_data.x
+    if hasattr(adt_data, "adt_x"):
+        adt_target = adt_data.adt_x
+    elif hasattr(adt_data, "x") and adt_data.x is not None:
+        adt_target = adt_data.x
+    else:
+        raise RuntimeError(
+            "adt_data has neither 'adt_x' nor 'x' — cannot compute ADT regression targets. "
+            "Ensure rna_data.adt_x = adt_data.x is set before constructing the NeighborLoader."
+        )
     # Cast outputs to float32: model runs in float16 under AMP autocast but loss
     # computation must be float32 to avoid mixed-dtype backward errors.
     adt_pred = adt_pred.float()
@@ -1587,12 +1690,23 @@ def _training_step(
         
         for i, batch in enumerate(train_loader):
             batch = batch.to(device)
-            # Use precomputed stats from batch
+            # CRITICAL-5: batch.x contains RNA features. Extract the corresponding
+            # ADT features for the sampled nodes using the global node IDs (n_id)
+            # provided by NeighborLoader so real protein values reach the ADT branch.
+            x_adt_batch: Optional[torch.Tensor] = None
+            if hasattr(batch, "n_id"):
+                # BUG-P3-1: feed raw (pre-z-score) ADT to the model's ADT branch.
+                # adt_data.x_raw holds the original protein values before
+                # train_gat_transformer_fusion applied z-score in _preprocess_adt_data.
+                # Feeding z-scored targets here confuses the adt_input_proj projection.
+                adt_raw = getattr(adt_data, "x_raw", adt_data.x)  # fallback if x_raw absent
+                x_adt_batch = adt_raw[batch.n_id.cpu()].to(device)
             adt_pred, aml_pred, fused = _forward_pass(
-                model, batch, batch, # Passing batch as both rna and adt
-                batch.node_degrees, batch.node_degrees, # Approximating ADT stats
+                model, batch, adt_data,
+                batch.node_degrees, batch.node_degrees,
                 batch.clustering_coeffs, batch.clustering_coeffs,
-                use_mixed_precision, device
+                use_mixed_precision, device,
+                x_adt=x_adt_batch,
             )
             
             # Map labels to batch if needed
@@ -1622,13 +1736,29 @@ def _training_step(
             total_cell += cell_l.item()
             n_batches += 1
             
+        # BUG-P3-5: flush any remaining gradients from a partial last batch.
+        # If n_batches % gradient_accumulation_steps != 0,
+        # the last partial batch's gradients were accumulated but scaler.step()
+        # was never called, which would bleed stale gradients into the next epoch.
+        if n_batches % gradient_accumulation_steps != 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=MAX_GRAD_NORM)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
         return total_adt/n_batches, total_reg/n_batches, total_aml/n_batches, total_cell/n_batches
 
     # Fallback to full-graph training logic
     try:
+        # BUG-P3-1: pass raw ADT features (adt_data.x_raw before z-score) to the
+        # model's ADT branch so the adt_input_proj sees protein-count space.
+        # adt_data.x_raw is saved by train_gat_transformer_fusion before calling
+        # _preprocess_adt_data. Fall back to adt_data.x when x_raw is unavailable.
+        x_adt_input = getattr(adt_data, "x_raw", adt_data.x)
         adt_pred, aml_pred, fused = _forward_pass(
             model, rna_data, adt_data, node_degrees_rna, node_degrees_adt,
-            clustering_coeffs_rna, clustering_coeffs_adt, use_mixed_precision, device
+            clustering_coeffs_rna, clustering_coeffs_adt, use_mixed_precision, device,
+            x_adt=x_adt_input,
         )
         total_loss, adt_l, aml_l, cell_l, reg_l = _compute_training_loss(
             model, adt_pred, aml_pred, fused, adt_data, aml_labels, celltype_labels,
@@ -1681,8 +1811,10 @@ def _compute_correlations_vectorized(
     )
     pearson_corrs = numerator / (denominator + EPSILON)
 
-    t_ranks = np.apply_along_axis(rankdata, 0, t)
-    p_ranks = np.apply_along_axis(rankdata, 0, p)
+    # MEDIUM-5: apply_along_axis is a sequential Python loop; rankdata(axis=0)
+    # vectorises the operation across all proteins simultaneously.
+    t_ranks = rankdata(t, axis=0)
+    p_ranks = rankdata(p, axis=0)
     tr_centered = t_ranks - np.mean(t_ranks, axis=0)
     pr_centered = p_ranks - np.mean(p_ranks, axis=0)
     num_rank = np.sum(tr_centered * pr_centered, axis=0)
@@ -1727,7 +1859,10 @@ def _compute_regression_metrics(
     mse = mean_squared_error(target_np, pred_np)
     rmse = float(np.sqrt(mse))
     mae = mean_absolute_error(target_np, pred_np)
-    r2 = r2_score(target_np.reshape(-1), pred_np.reshape(-1))
+    # MEDIUM-4: per-protein mean R² is the biologically meaningful metric.
+    # Flattening all proteins together produces a single global R² dominated by
+    # high-variance proteins and masks per-protein prediction quality.
+    r2 = r2_score(target_np, pred_np, multioutput='uniform_average')
     return float(mse), rmse, float(mae), float(r2)
 
 
@@ -1817,6 +1952,9 @@ def _evaluate_model(
 
     try:
         with torch.inference_mode():
+            # HIGH-4: always disable AMP during evaluation. Under inference_mode +
+            # AMP, half-precision intermediates can produce NaN MSE for small-scale
+            # protein values. Full precision is cheap at eval time.
             adt_pred, aml_pred, fused = _forward_pass(
                 model,
                 rna_data,
@@ -1825,8 +1963,9 @@ def _evaluate_model(
                 node_degrees_adt,
                 clustering_coeffs_rna,
                 clustering_coeffs_adt,
-                use_mixed_precision,
+                False,  # AMP always off during evaluation
                 device,
+                x_adt=adt_data.x,  # CRITICAL-2: pass real ADT features
             )
     except RuntimeError as e:
         err_str = str(e).lower()
@@ -1842,6 +1981,7 @@ def _evaluate_model(
                     clustering_coeffs_adt,
                     False,
                     device,
+                    x_adt=adt_data.x,
                 )
         else:
             raise

@@ -25,13 +25,15 @@ def clr_normalize(adata: ad.AnnData, axis: int = 1) -> ad.AnnData:
     # Convert to dense if sparse
     X = adata_clr.X.toarray() if sparse.issparse(adata_clr.X) else adata_clr.X.copy()
     
-    # Check for negative values and handle them
+    # HIGH-7: CLR requires raw non-negative counts. Re-logging already-logged data
+    # (e.g. values in [-3, 3]) produces a double-log transformation.
     if np.any(X < 0):
-        print(f"Warning: Found {np.sum(X < 0)} negative values in data. Adding offset.")
-        X = X - X.min() + 1.0
-    else:
-        # Add pseudocount (avoid log(0))
-        X += 1.0
+        raise ValueError(
+            "clr_normalize received negative values. Input must be raw, non-negative "
+            "counts (not pre-log-normalised). Pass raw count matrices to CLR."
+        )
+    # Add pseudocount (avoid log(0))
+    X += 1.0
     
     # CLR transformation: log(X / geometric_mean(X))
     if axis == 1:  # Normalize across features (per cell)
@@ -84,10 +86,15 @@ def zscore_normalize(adata: ad.AnnData) -> Tuple[ad.AnnData, np.ndarray, np.ndar
     
     # Calculate mean and std for each feature (column)
     means = np.nanmean(X, axis=0, keepdims=True)
-    stds = np.nanstd(X, axis=0, keepdims=True) + 1e-8  # Add small epsilon to avoid division by zero
-    
-    # Handle edge cases where std is 0
-    stds = np.where(stds == 0, 1.0, stds)
+    stds = np.nanstd(X, axis=0, keepdims=True)
+
+    # BUG-P3-3: the old code added 1e-8 to all stds unconditionally, which
+    # looks safe but lets near-zero-variance proteins (std < 1e-6) survive
+    # with artificially tiny denominators.  At test time, even tiny deviations
+    # from the training mean are amplified by up to 1e+8, exploding targets.
+    # Replace near-zero stds with 1.0 (identity transform for constant proteins)
+    # so their z-scored value stays ≈0 for all cells.
+    stds = np.where(stds < 1e-6, 1.0, stds)
     
     # Apply z-score normalization
     X_zscore = (X - means) / stds
@@ -103,16 +110,39 @@ def zscore_normalize(adata: ad.AnnData) -> Tuple[ad.AnnData, np.ndarray, np.ndar
 
 from typing import Dict, Tuple, List, Optional
 
+# CRITICAL-8: default dataset paths — loaded lazily (not at import time)
+_DEFAULT_RNA_CONTROL = "/projects/vanaja_lab/satya/Datasets/GSMControlRNA.h5ad"
+_DEFAULT_ADT_CONTROL = "/projects/vanaja_lab/satya/Datasets/ControlADT.h5ad"
+_DEFAULT_RNA_AML_A   = "/projects/vanaja_lab/satya/Datasets/AMLARNA.h5ad"
+_DEFAULT_ADT_AML_A   = "/projects/vanaja_lab/satya/Datasets/AMLAADT.h5ad"
+_DEFAULT_RNA_AML_B   = "/projects/vanaja_lab/satya/Datasets/AMLBRNA.h5ad"
+_DEFAULT_ADT_AML_B   = "/projects/vanaja_lab/satya/Datasets/AMLBADT.h5ad"
+
 
 def prepare_train_test_anndata(
-    GSM_Controls_RNA=sc.read_h5ad("/projects/vanaja_lab/satya/Datasets/GSMControlRNA.h5ad"),
-    GSM_Controls_ADT=sc.read_h5ad("/projects/vanaja_lab/satya/Datasets/ControlADT.h5ad"),
-    GSM_AML_RNA_A=sc.read_h5ad("/projects/vanaja_lab/satya/Datasets/AMLARNA.h5ad"),
-    GSM_AML_ADT_A=sc.read_h5ad("/projects/vanaja_lab/satya/Datasets/AMLAADT.h5ad"),
-    GSM_AML_RNA_B=sc.read_h5ad("/projects/vanaja_lab/satya/Datasets/AMLBRNA.h5ad"),
-    GSM_AML_ADT_B=sc.read_h5ad("/projects/vanaja_lab/satya/Datasets/AMLBADT.h5ad"),
+    GSM_Controls_RNA=None,
+    GSM_Controls_ADT=None,
+    GSM_AML_RNA_A=None,
+    GSM_AML_ADT_A=None,
+    GSM_AML_RNA_B=None,
+    GSM_AML_ADT_B=None,
     marker_list: Optional[List[str]] = None,
 ):
+    # Lazy-load default datasets only when the function is actually called.
+    if GSM_Controls_RNA is None:
+        GSM_Controls_RNA = sc.read_h5ad(_DEFAULT_RNA_CONTROL)
+    if GSM_Controls_ADT is None:
+        GSM_Controls_ADT = sc.read_h5ad(_DEFAULT_ADT_CONTROL)
+    if GSM_AML_RNA_A is None:
+        GSM_AML_RNA_A = sc.read_h5ad(_DEFAULT_RNA_AML_A)
+    if GSM_AML_ADT_A is None:
+        GSM_AML_ADT_A = sc.read_h5ad(_DEFAULT_ADT_AML_A)
+    if GSM_AML_RNA_B is None:
+        GSM_AML_RNA_B = sc.read_h5ad(_DEFAULT_RNA_AML_B)
+    if GSM_AML_ADT_B is None:
+        GSM_AML_ADT_B = sc.read_h5ad(_DEFAULT_ADT_AML_B)
+    # HIGH-6: use identical sample order for both modalities so row i in RNA
+    # always corresponds to row i in ADT before barcode alignment.
     adata_gene = anndata.concat(
         [GSM_AML_RNA_B, GSM_AML_RNA_A, GSM_Controls_RNA],
         join="outer",
@@ -121,11 +151,20 @@ def prepare_train_test_anndata(
     )
 
     adata_protein = anndata.concat(
-        [GSM_Controls_ADT, GSM_AML_ADT_A, GSM_AML_ADT_B],
+        [GSM_AML_ADT_B, GSM_AML_ADT_A, GSM_Controls_ADT],
         join="outer",
         label="source",
-        keys=["GSM_Controls_ADT", "GSM_AML_ADT_A", "GSM_AML_ADT_B"],
+        keys=["GSM_AML_ADT_B", "GSM_AML_ADT_A", "GSM_Controls_ADT"],
     )
+
+    # ROBUSTNESS-P3-3: join="outer" fills missing genes/proteins with NaN.
+    # These NaN values propagate silently into GATConv forward passes, producing
+    # NaN losses immediately. Fill with 0 (zero-expression for missing genes).
+    import scipy.sparse as sp_check
+    for _adata in (adata_gene, adata_protein):
+        if sp_check.issparse(_adata.X):
+            _adata.X = _adata.X.toarray()
+        _adata.X = np.nan_to_num(_adata.X, nan=0.0)
 
     if marker_list is not None:
         available_markers = [m for m in marker_list if m in adata_protein.var_names]
@@ -177,6 +216,17 @@ def prepare_train_test_anndata(
     adata_protein_test = adata_protein[~train_mask_protein].copy()
 
     def align_obs(gene_data, protein_data):
+        # ROBUSTNESS-P3-4: check for barcode recycling before intersection.
+        # Duplicate barcodes (same barcode in two samples) survive anndata.concat
+        # with a suffix, but if barcodes were already unique across samples sorted()
+        # below could silently pick one cell over another.
+        assert gene_data.obs_names.is_unique, (
+            "Duplicate barcodes in RNA after concat — possible barcode recycling across samples. "
+            "Check that each input AnnData has distinct barcodes (e.g., sample-suffixed)."
+        )
+        assert protein_data.obs_names.is_unique, (
+            "Duplicate barcodes in ADT after concat — possible barcode recycling across samples."
+        )
         common_cells = sorted(
             set(gene_data.obs_names).intersection(set(protein_data.obs_names))
         )
@@ -185,6 +235,9 @@ def prepare_train_test_anndata(
         assert all(
             gene_data_aligned.obs_names == protein_data_aligned.obs_names
         ), "Cell IDs do not match after alignment!"
+        # HIGH-6: verify final alignment — catches recycled barcodes across samples
+        assert gene_data_aligned.obs_names.equals(protein_data_aligned.obs_names), \
+            "RNA and ADT obs_names differ after alignment — possible barcode collision."
         return gene_data_aligned, protein_data_aligned
 
     adata_gene_train, adata_protein_train = align_obs(
