@@ -125,7 +125,7 @@ def build_pyg_data(adata, use_pca=True, use_rep=None, sparsify_large_graphs=True
     edge_index = to_undirected(edge_index, num_nodes=adjacency_matrix.shape[0])
 
     pyg_data = Data(
-        x=torch.tensor(node_features, dtype=torch.float32),
+        x=torch.tensor(np.ascontiguousarray(node_features), dtype=torch.float32),
         edge_index=edge_index,
         y=torch.tensor(node_labels, dtype=torch.long),
     )

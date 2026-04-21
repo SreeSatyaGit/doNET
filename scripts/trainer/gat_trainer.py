@@ -1,58 +1,4 @@
 # gat_trainer.py
-"""
-GAT Transformer Fusion Training Module
-
-This module provides the main training pipeline for DeepOMAPNet,
-a Graph Attention Network with Transformer Fusion for RNA-to-ADT mapping
-in single-cell CITE-seq data.
-
-Key Features:
-    - Multi-task learning: ADT prediction + AML classification + cell type classification
-    - Graph attention networks with transformer fusion
-    - Automatic mixed precision training
-    - Early stopping with best model restoration
-    - Stratified data splitting
-    - Comprehensive error handling and OOM recovery
-
-Basic Usage:
-    >>> from scripts.trainer.gat_trainer import train_gat_transformer_fusion
-    >>>
-    >>> result = train_gat_transformer_fusion(
-    ...     rna_data=rna_pyg,
-    ...     adt_data=adt_pyg,
-    ...     epochs=100,
-    ...     learning_rate=1e-3,
-    ...     hidden_channels=64,
-    ...     num_heads=4
-    ... )
-    >>> print(f"Best validation R²: {result.get_best_val_r2():.4f}")
-    >>> print(f"Final test R²: {result.get_final_test_r2():.4f}")
-    >>> predictions = result.predict_adt(new_rna_features)
-
-Advanced Usage with Multi-Task Learning:
-    >>> result = train_gat_transformer_fusion(
-    ...     rna_data=rna_pyg,
-    ...     adt_data=adt_pyg,
-    ...     aml_labels=aml_labels,
-    ...     classification_weight=0.5,
-    ...     epochs=100
-    ... )
-
-Memory-Constrained Training:
-    >>> result = train_gat_transformer_fusion(
-    ...     rna_data=rna_pyg,
-    ...     adt_data=adt_pyg,
-    ...     gradient_accumulation_steps=4,
-    ...     hidden_channels=32,
-    ...     use_cpu_fallback=True,
-    ...     epochs=100
-    ... )
-
-Exceptions:
-    DeviceSwitchRequired: Raised when GPU OOM requires CPU fallback
-    ValueError: Raised for invalid input parameters
-    TypeError: Raised for incorrect input types
-"""
 
 import gc
 import logging
@@ -315,11 +261,6 @@ class TrainingResult:
         yield self.graph_stats.node_degrees_adt
         yield self.graph_stats.clustering_coeffs_rna
         yield self.graph_stats.clustering_coeffs_adt
-
-
-# ============================================================================
-# PUBLIC API
-# ============================================================================
 
 
 def compute_multi_task_loss(
@@ -603,19 +544,11 @@ def train_gat_transformer_fusion(
     if rna_anndata is not None:
         rna_input_dim = _preprocess_rna_data(rna_data, rna_anndata)
 
-    # BUG-P3-1: save the pre-normalisation ADT matrix as x_raw BEFORE
-    # _preprocess_adt_data writes z-scored values into adt_data.x.
-    # The model's adt_input_proj is designed to receive raw (CLR-only) protein
-    # values; feeding z-scored targets to it shifts the input distribution by
-    # the mean and collapses scale.  x_raw is indexed by global node IDs in
-    # the mini-batch path and used directly in the full-graph path.
-    adt_data.x_raw = adt_data.x.clone() if adt_anndata is None else None  # populated after preprocess
+
+    adt_data.x_raw = adt_data.x.clone() if adt_anndata is None else None 
     adt_mean, adt_std = _preprocess_adt_data(adt_data, adt_anndata, already_normalized=adt_already_normalized)
-    # After _preprocess_adt_data, adt_data.x is z-scored; x_raw must be the pre-z-score version.
-    # When adt_anndata is provided, _preprocess_adt_data overwrites adt_data.x with the raw
-    # AnnData matrix first, then z-scores it; capture x_raw at that intermediate point.
+
     if adt_data.x_raw is None:
-        # adt_anndata path: x_raw = adt_data.x * adt_std + adt_mean (denormalise back)
         adt_data.x_raw = adt_data.x * adt_std + adt_mean
     adt_output_dim = adt_data.x.size(1)
 
@@ -626,9 +559,7 @@ def train_gat_transformer_fusion(
             aml_labels_np = np.array(aml_labels)
         aml_labels = aml_labels_np
 
-    # Apply caps with warnings (Phase 2.1)
-    # MEDIUM-3: also surface as a Python UserWarning so caller code can detect the
-    # silent architecture change (e.g. via warnings.filterwarnings).
+
     import warnings
     if hidden_channels > MAX_HIDDEN_CHANNELS:
         msg = (
@@ -679,8 +610,6 @@ def train_gat_transformer_fusion(
         dropout_rate=dropout_rate,
         device=device,
         num_cell_types=num_cell_types,
-        # CRITICAL-2: pass ADT feature dim so the model builds adt_input_proj
-        # and routes real protein measurements into the ADT branch.
         adt_in_channels=adt_output_dim,
     )
 
@@ -730,7 +659,6 @@ def train_gat_transformer_fusion(
         num_nodes,
     )
 
-    # Attach stats to data objects for loader to pick up (Phase 2.3 - Scaling)
     rna_data.node_degrees = node_degrees_rna.cpu()
     rna_data.clustering_coeffs = clustering_coeffs_rna.cpu()
     adt_data.node_degrees = node_degrees_adt.cpu()
@@ -747,24 +675,6 @@ def train_gat_transformer_fusion(
     # Setup Neighbor Sampling Loaders (Phase 2.3)
     train_loader = None
     if use_neighbor_sampling:
-        try:
-            # NeighborLoader's worker processes require pyg-lib or torch-sparse.
-            # Probe for either before constructing the loader so we can fall back cleanly.
-            try:
-                import pyg_lib  # noqa: F401
-                _has_backend = True
-            except ImportError:
-                try:
-                    import torch_sparse  # noqa: F401
-                    _has_backend = True
-                except ImportError:
-                    _has_backend = False
-
-            if not _has_backend:
-                raise ImportError(
-                    "'NeighborSampler' requires either 'pyg-lib' or 'torch-sparse'"
-                )
-
             from torch_geometric.loader import NeighborLoader
             logger.info(f"Setting up NeighborLoader with batch_size={batch_size}")
             # Attach ADT features onto the RNA graph so each mini-batch carries
@@ -779,12 +689,6 @@ def train_gat_transformer_fusion(
                 num_workers=num_workers,
                 persistent_workers=True if num_workers > 0 else False
             )
-        except (ImportError, Exception) as e:
-            logger.warning(
-                f"NeighborLoader unavailable ({e}); falling back to full-graph training. "
-                "Install 'pyg-lib' or 'torch-sparse' to enable neighbor sampling."
-            )
-            train_loader = None
 
     training_history = _run_training_loop(
         model=model,
@@ -1690,16 +1594,9 @@ def _training_step(
         
         for i, batch in enumerate(train_loader):
             batch = batch.to(device)
-            # CRITICAL-5: batch.x contains RNA features. Extract the corresponding
-            # ADT features for the sampled nodes using the global node IDs (n_id)
-            # provided by NeighborLoader so real protein values reach the ADT branch.
             x_adt_batch: Optional[torch.Tensor] = None
             if hasattr(batch, "n_id"):
-                # BUG-P3-1: feed raw (pre-z-score) ADT to the model's ADT branch.
-                # adt_data.x_raw holds the original protein values before
-                # train_gat_transformer_fusion applied z-score in _preprocess_adt_data.
-                # Feeding z-scored targets here confuses the adt_input_proj projection.
-                adt_raw = getattr(adt_data, "x_raw", adt_data.x)  # fallback if x_raw absent
+                adt_raw = getattr(adt_data, "x_raw", adt_data.x) 
                 x_adt_batch = adt_raw[batch.n_id.cpu()].to(device)
             adt_pred, aml_pred, fused = _forward_pass(
                 model, batch, adt_data,
@@ -1736,10 +1633,6 @@ def _training_step(
             total_cell += cell_l.item()
             n_batches += 1
             
-        # BUG-P3-5: flush any remaining gradients from a partial last batch.
-        # If n_batches % gradient_accumulation_steps != 0,
-        # the last partial batch's gradients were accumulated but scaler.step()
-        # was never called, which would bleed stale gradients into the next epoch.
         if n_batches % gradient_accumulation_steps != 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=MAX_GRAD_NORM)
             scaler.step(optimizer)
@@ -1750,10 +1643,6 @@ def _training_step(
 
     # Fallback to full-graph training logic
     try:
-        # BUG-P3-1: pass raw ADT features (adt_data.x_raw before z-score) to the
-        # model's ADT branch so the adt_input_proj sees protein-count space.
-        # adt_data.x_raw is saved by train_gat_transformer_fusion before calling
-        # _preprocess_adt_data. Fall back to adt_data.x when x_raw is unavailable.
         x_adt_input = getattr(adt_data, "x_raw", adt_data.x)
         adt_pred, aml_pred, fused = _forward_pass(
             model, rna_data, adt_data, node_degrees_rna, node_degrees_adt,
@@ -1811,8 +1700,6 @@ def _compute_correlations_vectorized(
     )
     pearson_corrs = numerator / (denominator + EPSILON)
 
-    # MEDIUM-5: apply_along_axis is a sequential Python loop; rankdata(axis=0)
-    # vectorises the operation across all proteins simultaneously.
     t_ranks = rankdata(t, axis=0)
     p_ranks = rankdata(p, axis=0)
     tr_centered = t_ranks - np.mean(t_ranks, axis=0)
@@ -1859,9 +1746,6 @@ def _compute_regression_metrics(
     mse = mean_squared_error(target_np, pred_np)
     rmse = float(np.sqrt(mse))
     mae = mean_absolute_error(target_np, pred_np)
-    # MEDIUM-4: per-protein mean R² is the biologically meaningful metric.
-    # Flattening all proteins together produces a single global R² dominated by
-    # high-variance proteins and masks per-protein prediction quality.
     r2 = r2_score(target_np, pred_np, multioutput='uniform_average')
     return float(mse), rmse, float(mae), float(r2)
 
@@ -1952,9 +1836,6 @@ def _evaluate_model(
 
     try:
         with torch.inference_mode():
-            # HIGH-4: always disable AMP during evaluation. Under inference_mode +
-            # AMP, half-precision intermediates can produce NaN MSE for small-scale
-            # protein values. Full precision is cheap at eval time.
             adt_pred, aml_pred, fused = _forward_pass(
                 model,
                 rna_data,

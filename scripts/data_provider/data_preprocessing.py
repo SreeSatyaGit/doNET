@@ -88,12 +88,6 @@ def zscore_normalize(adata: ad.AnnData) -> Tuple[ad.AnnData, np.ndarray, np.ndar
     means = np.nanmean(X, axis=0, keepdims=True)
     stds = np.nanstd(X, axis=0, keepdims=True)
 
-    # BUG-P3-3: the old code added 1e-8 to all stds unconditionally, which
-    # looks safe but lets near-zero-variance proteins (std < 1e-6) survive
-    # with artificially tiny denominators.  At test time, even tiny deviations
-    # from the training mean are amplified by up to 1e+8, exploding targets.
-    # Replace near-zero stds with 1.0 (identity transform for constant proteins)
-    # so their z-scored value stays ≈0 for all cells.
     stds = np.where(stds < 1e-6, 1.0, stds)
     
     # Apply z-score normalization
