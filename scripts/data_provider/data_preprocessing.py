@@ -19,14 +19,11 @@ def clr_normalize(adata: ad.AnnData, axis: int = 1) -> ad.AnnData:
     Returns:
         CLR-normalized AnnData object
     """
-    # Make a copy to avoid modifying original
     adata_clr = adata.copy()
     
     # Convert to dense if sparse
     X = adata_clr.X.toarray() if sparse.issparse(adata_clr.X) else adata_clr.X.copy()
     
-    # HIGH-7: CLR requires raw non-negative counts. Re-logging already-logged data
-    # (e.g. values in [-3, 3]) produces a double-log transformation.
     if np.any(X < 0):
         raise ValueError(
             "clr_normalize received negative values. Input must be raw, non-negative "
@@ -36,24 +33,19 @@ def clr_normalize(adata: ad.AnnData, axis: int = 1) -> ad.AnnData:
     X += 1.0
     
     # CLR transformation: log(X / geometric_mean(X))
-    if axis == 1:  # Normalize across features (per cell)
-        # Calculate geometric mean for each cell (row)
+    if axis == 1: 
         with np.errstate(divide='ignore', invalid='ignore'):
             log_X = np.log(X)
             geometric_means = np.exp(np.mean(log_X, axis=1, keepdims=True))
-            # Replace any invalid values with 1
             geometric_means = np.where(np.isfinite(geometric_means), geometric_means, 1.0)
             X_clr = np.log(X / geometric_means)
     else:  # Normalize across cells (per feature)
-        # Calculate geometric mean for each feature (column)
         with np.errstate(divide='ignore', invalid='ignore'):
             log_X = np.log(X)
             geometric_means = np.exp(np.mean(log_X, axis=0, keepdims=True))
-            # Replace any invalid values with 1
             geometric_means = np.where(np.isfinite(geometric_means), geometric_means, 1.0)
             X_clr = np.log(X / geometric_means)
     
-    # Replace any remaining NaN or inf values with 0
     X_clr = np.nan_to_num(X_clr, nan=0.0, posinf=0.0, neginf=0.0)
     
     # Update AnnData
