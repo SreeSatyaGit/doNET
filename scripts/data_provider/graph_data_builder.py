@@ -45,7 +45,6 @@ def sparsify_graph(adata, max_edges_per_node=50):
         shape=(num_nodes, num_nodes)
     )
 
-    # MEDIUM-6: keep an edge if EITHER direction survived pruning (logical max), not average
     sparse_adjacency = sparse_adjacency.maximum(sparse_adjacency.T)
     adata.obsp["connectivities"] = sparse_adjacency
 
@@ -118,8 +117,6 @@ def build_pyg_data(adata, use_pca=True, use_rep=None, sparsify_large_graphs=True
         
     node_labels = adata.obs["leiden"].astype(int).to_numpy()
     adjacency_matrix = adata.obsp["connectivities"].tocsr()
-    # CRITICAL-9: GATConv expects bidirectional edges; extract all non-zero entries
-    # and call to_undirected to guarantee both (i→j) and (j→i) are present.
     source_nodes, target_nodes = adjacency_matrix.nonzero()
     edge_index = torch.tensor(np.vstack([source_nodes, target_nodes]), dtype=torch.long)
     edge_index = to_undirected(edge_index, num_nodes=adjacency_matrix.shape[0])

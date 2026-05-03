@@ -144,8 +144,6 @@ class SparseCrossAttentionLayer(nn.Module):
             num_nodes,
             device,
             edge_index.data_ptr(),
-            # CRITICAL-3: use content-based hash; _version is a private PyTorch
-            # internal removed in PyTorch >= 2.2 and unreliable under torch.compile.
             hash(edge_index.data_ptr()) ^ hash(tuple(edge_index.shape)),
             tuple(edge_index.shape),
             edge_index_sym,
@@ -208,9 +206,6 @@ class SparseCrossAttentionLayer(nn.Module):
             attention_weights: [nhead, N, N] (if return_attention=True)
         """
         if self.use_positional_encoding:
-            # HIGH-2: encode only the query (RNA); applying the same PE to both
-            # modalities forces them into identical positional subspaces and
-            # collapses cross-modal information.
             query = self.pos_encoding(query, edge_index, node_degrees, clustering_coeffs)
 
         q = self.norm_q(query)
@@ -303,8 +298,6 @@ class CrossAttentionLayer(nn.Module):
             attention_weights: [nhead, N, N] (if return_attention=True)
         """
         if self.use_positional_encoding:
-            # HIGH-2: encode only the query; same-PE on both modalities collapses
-            # cross-modal information into identical positional subspaces.
             query = self.pos_encoding(query, edge_index, node_degrees, clustering_coeffs)
 
         q = self.norm_q(query)
@@ -379,9 +372,6 @@ class AdapterLayer(nn.Module):
         """Compute L2 regularization loss for adapter parameters (Frobenius norm)."""
         l2_loss = torch.tensor(0.0, device=self.down.weight.device)
         for param in [self.down.weight, self.up.weight]:
-            # MEDIUM-1: torch.norm(p=2) on a matrix is the spectral norm (largest
-            # singular value), not the element-wise Frobenius norm used by weight
-            # decay. Use .pow(2).sum() for true Frobenius-squared regularization.
             l2_loss += param.pow(2).sum()
         return self.adapter_l2_reg * l2_loss
 
@@ -441,9 +431,6 @@ class TransformerFusion(nn.Module):
         ])
         
         if use_adapters:
-            # CRITICAL-1: RNA and ADT live in completely different biological
-            # spaces; sharing one AdapterLayer receives conflicting gradient signals
-            # from both distributions and can never specialize. Use separate lists.
             self.rna_adapters = nn.ModuleList([
                 AdapterLayer(embedding_dim, reduction_factor=reduction_factor,
                              dropout=dropout, adapter_l2_reg=adapter_l2_reg)
@@ -461,9 +448,6 @@ class TransformerFusion(nn.Module):
         self.adt_norms = nn.ModuleList([
             nn.LayerNorm(embedding_dim) for _ in range(num_layers)
         ])
-        # HIGH-3: LayerNorm after cross-attention residual (pre-LN convention).
-        # Without this, the cross-attention residual path is unnormalized while
-        # the self-attention path is, causing exploding activations across layers.
         self.rna_post_cross_norms = nn.ModuleList([
             nn.LayerNorm(embedding_dim) for _ in range(num_layers)
         ])
@@ -595,9 +579,6 @@ class GATWithTransformerFusion(torch.nn.Module):
         self.gat_rna1 = GATConv(in_channels, hidden_channels, heads=heads, dropout=dropout)
         self.gat_rna2 = GATConv(hidden_channels * heads, hidden_channels, heads=1, dropout=dropout)
 
-        # CRITICAL-2: project real ADT features into the hidden space.
-        # When adt_in_channels is None the model falls back to using the RNA
-        # embeddings (old behaviour), but cross-modal fusion is then meaningless.
         self._has_adt_input = adt_in_channels is not None
         if self._has_adt_input:
             self.adt_input_proj = nn.Linear(adt_in_channels, hidden_channels)
@@ -703,12 +684,10 @@ class GATWithTransformerFusion(torch.nn.Module):
         rna_embeddings = self.batch_norm_rna(rna_embeddings)
 
         edge_index_adt = edge_index_adt if edge_index_adt is not None else edge_index_rna
-        # CRITICAL-2: use real ADT features when available so the transformer
-        # performs true cross-modal attention rather than RNA→RNA self-attention.
         if self._has_adt_input and x_adt is not None:
             adt_init_input = self.adt_input_proj(x_adt)
         else:
-            adt_init_input = rna_embeddings  # fallback: original (incorrect) behaviour
+            adt_init_input = rna_embeddings 
         initial_adt = self.gat_adt_init(adt_init_input, edge_index_adt)
         initial_adt = F.elu(initial_adt)
         initial_adt = self.batch_norm_adt(initial_adt)
@@ -774,7 +753,6 @@ class GATWithTransformerFusion(torch.nn.Module):
 
         Mirrors forward() exactly — including batch norms — so the embedding
         space is consistent with what the model saw during training.
-        (CRITICAL-4: previous version skipped batch_norm_rna / batch_norm_adt.)
         """
         with torch.no_grad():
             x = F.dropout(x, p=self.dropout, training=False)
@@ -783,7 +761,6 @@ class GATWithTransformerFusion(torch.nn.Module):
             x = F.dropout(x, p=self.dropout, training=False)
             rna_embeddings = self.gat_rna2(x, edge_index_rna)
             rna_embeddings = F.elu(rna_embeddings)
-            # CRITICAL-4: apply batch norm to match forward() normalisation.
             rna_embeddings = self.batch_norm_rna(rna_embeddings)
 
             edge_index_adt = edge_index_adt if edge_index_adt is not None else edge_index_rna
@@ -793,7 +770,6 @@ class GATWithTransformerFusion(torch.nn.Module):
                 adt_init_input = rna_embeddings
             initial_adt = self.gat_adt_init(adt_init_input, edge_index_adt)
             initial_adt = F.elu(initial_adt)
-            # CRITICAL-4: apply batch norm to match forward() normalisation.
             initial_adt = self.batch_norm_adt(initial_adt)
 
             fused_embeddings = self.transformer_fusion(
@@ -810,10 +786,6 @@ class GATWithTransformerFusion(torch.nn.Module):
                               x_adt=None):
         """Extract attention weights from all layers for visualization.
 
-        BUG-1 fix: now accepts x_adt and routes real protein features through
-        adt_input_proj, exactly mirroring forward(). The old version hardcoded
-        rna_embeddings as the ADT init input, so all attention maps reflected
-        RNA→RNA self-attention rather than RNA↔ADT cross-modal attention.
 
         Args:
             x: RNA input features [N, in_channels]
@@ -847,7 +819,6 @@ class GATWithTransformerFusion(torch.nn.Module):
             rna_embeddings = self.batch_norm_rna(rna_embeddings)
 
             edge_index_adt = edge_index_adt if edge_index_adt is not None else edge_index_rna
-            # BUG-1: use real ADT features when provided (mirrors forward()).
             if self._has_adt_input and x_adt is not None:
                 adt_init_input = self.adt_input_proj(x_adt)
             else:
@@ -903,10 +874,6 @@ def compute_graph_statistics_fast(edge_index, num_nodes):
     """
     device = edge_index.device
 
-    # HIGH-1: for an undirected graph every edge appears as both (i,j) and (j,i).
-    # Counting only the source row (edge_index[0]) gives the true degree without
-    # double-counting.  The old code added in-degree on top of out-degree, so
-    # degrees were 2× the correct value.
     node_degrees = torch.zeros(num_nodes, device=device, dtype=torch.float32)
     row = edge_index[0]
     node_degrees.scatter_add_(0, row, torch.ones(row.size(0), dtype=torch.float32, device=device))
